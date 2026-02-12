@@ -1,0 +1,6 @@
+/home/comp/csrkzhu/miniconda3/envs/nnunet/lib/python3.10/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+/home/comp/csrkzhu/code/Compare/nnUNet/nnunetv2/training/nnUNetTrainer/nnUNetTrainer.py:1114: RuntimeWarning: invalid value encountered in scalar divide
+  global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
+/home/comp/csrkzhu/code/Compare/nnUNet/nnunetv2/training/nnUNetTrainer/nnUNetTrainer.py:1114: RuntimeWarning: invalid value encountered in scalar divide
+  global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]

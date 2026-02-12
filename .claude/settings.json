@@ -1,0 +1,11 @@
+{
+    "env": {
+        "ANTHROPIC_AUTH_TOKEN": "cr_f82da50f67fd26d2039deeac4c763de3f0823979fb876ac8e9f8bad7c8fee490",
+        "ANTHROPIC_BASE_URL": "https://co.yes.vg",
+        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+    },
+    "model": "opus",
+    "permissions": {
+        "defaultMode": "bypassPermissions"
+  }
+}

@@ -1,0 +1,79 @@
+# Dataset directories
+/Dataset/
+
+# nnUnet data and results
+nnUnet/nnUNet_data/
+nnUnet/nnUNet_raw/
+nnUnet/nnUNet_preprocessed/
+nnUnet/nnUNet_results/
+
+# HyperbodyV1 outputs and visualizations
+HyperbodyV1/docs/visualizations/
+HyperbodyV1/outputs/
+HyperbodyV1/logs/
+HyperbodyV1/checkpoints/
+HyperbodyV1/wandb/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch model files
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db
+
+# Environment variables
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large files
+*.h5
+*.hdf5
+*.npy
+*.npz

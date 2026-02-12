@@ -1,0 +1,13 @@
+model_provider = "duckcoding"
+model = "gpt-5.3-codex"
+model_reasoning_effort = "xhigh"
+network_access = "enabled"
+disable_response_storage = true
+approval_policy = "on-failure"
+default_sandbox = "workspace-write"
+
+[model_providers.duckcoding]
+name = "duckcoding"
+base_url = "https://jp.duckcoding.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
