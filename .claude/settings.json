@@ -1,8 +1,7 @@
 {
     "env": {
-        "ANTHROPIC_AUTH_TOKEN": "cr_f82da50f67fd26d2039deeac4c763de3f0823979fb876ac8e9f8bad7c8fee490",
-        "ANTHROPIC_BASE_URL": "https://co.yes.vg",
-        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-sid01--4d2a8e02b0e4e828550ecdb3d5de5b7de343603519d625ac4698c8ce28888ba2",
+        "ANTHROPIC_BASE_URL": "https://relay.nf.video"
     },
     "model": "opus",
     "permissions": {

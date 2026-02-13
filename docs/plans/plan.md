@@ -177,13 +177,13 @@ Override these methods from `nnUNetTrainer`:
 | Method | What Changes |
 |--------|-------------|
 | `__init__` | Add `self.hyp_*` hyperparameters (embed_dim=32, curv=1.0, margin=0.4, weight=0.05, freeze_epochs=5, warmup_epochs=6, etc.) |
-| `initialize` | Build backbone via `get_network_from_plans()`, load hierarchy and graph distance (paths resolved via `nnUNet_raw` + dataset name, see Data Dependencies), wrap in `HyperBodyNet`, build hyp_loss (`LorentzTreeRankingLoss` with graph distances). DDP: `find_unused_parameters=True` (needed because `perform_actual_validation()` disables `hyperbolic_mode`, leaving `hyp_head`/`label_emb` unused). |
+| `initialize` | Build backbone via `get_network_from_plans()`, load hierarchy and graph distance (prefer `nnUNet_raw/{dataset_name}`; fallback to repo-level `Dataset/` for local runs), wrap in `HyperBodyNet`, build hyp_loss (`LorentzTreeRankingLoss` with graph distances). DDP: `find_unused_parameters=True` (needed because `perform_actual_validation()` disables `hyperbolic_mode`, leaving `hyp_head`/`label_emb` unused). |
 | `build_network_architecture` | **Static override.** Build PlainConvUNet, wrap in `HyperBodyNet`. Pass `class_depths=None` — safe because at inference `hyperbolic_mode=False` so `label_emb` is never called; weights come from checkpoint. When `enable_deep_supervision=False` (inference), set `hyperbolic_mode=False`. Read `embed_dim` from `arch_init_kwargs["features_per_stage"][0]` instead of hardcoding 32. Critical for `nnUNetPredictor.initialize_from_trained_model_folder` (line 104). |
 | `_build_loss` | Same as parent (DC_and_CE + DeepSupervision). Hyp loss built separately. |
 | `configure_optimizers` | Build **three optimizers + three schedulers**, store the two hyperbolic pairs as side-effect attributes (`self.optimizer_hyp_head`, `self.optimizer_hyp_emb`, `self.lr_scheduler_hyp_head`, `self.lr_scheduler_hyp_emb`). **Return only** `(optimizer_backbone, lr_scheduler_backbone)` so the base class unpacking `self.optimizer, self.lr_scheduler = self.configure_optimizers()` works. Separate optimizers for hyp_head and label_emb because `PolyLRScheduler` overwrites ALL param_group LRs with the same value — a single multi-group optimizer would destroy the lr ratio. (1) SGD(backbone, lr=0.01) + PolyLR, (2) AdamW(hyp_head, lr=1e-3) + PolyLR, (3) AdamW(label_emb, lr=1e-5) + PolyLR. |
-| `train_step` | Forward -> `(seg_output, voxel_emb, label_emb)`. `total_loss = seg_loss + 0.05 * hyp_loss`. Handle target: `target[0].squeeze(1).long()` for hyp_loss. Both optimizers zero_grad / step. Extra grad clip for label_emb on first unfreeze epoch. See "Dual optimizer in train_step" for full AMP pattern. |
+| `train_step` | Forward -> `(seg_output, voxel_emb, label_emb)`. `total_loss = seg_loss + 0.05 * hyp_loss`. Handle target: `target[0].squeeze(1).long()` for hyp_loss. Three optimizers zero_grad. Under AMP, only call `grad_scaler.unscale_/step` on optimizers that actually have gradients (prevents GradScaler assertion when `label_emb` is frozen). Extra grad clip for label_emb on first unfreeze epoch. See "Dual optimizer in train_step" for full AMP pattern. |
 | `validation_step` | Same forward as train_step but no backward. Compute both seg_loss and hyp_loss. Return `{'loss': ..., 'hyp_loss': ..., 'tp_hard': ..., 'fp_hard': ..., 'fn_hard': ...}`. Standard Dice metrics from seg_output. |
-| `on_train_epoch_start` | **Step all three schedulers:** `self.lr_scheduler.step(epoch)`, `self.lr_scheduler_hyp_head.step(epoch)`, `self.lr_scheduler_hyp_emb.step(epoch)`. Log all LRs. Call `hyp_loss.set_epoch(epoch, max_epochs)` for curriculum. Freeze/unfreeze `label_emb.tangent_embeddings` based on `hyp_freeze_epochs`. |
+| `on_train_epoch_start` | **Step all three schedulers:** `self.lr_scheduler.step(epoch)`, `self.lr_scheduler_hyp_head.step(epoch)`, `self.lr_scheduler_hyp_emb.step(epoch)`. Log all LRs (including hyperbolic keys initialized in logger). Call `hyp_loss.set_epoch(epoch, max_epochs)` for curriculum. Freeze/unfreeze `label_emb.tangent_embeddings` based on `hyp_freeze_epochs`. |
 | `on_train_epoch_end` | Log seg_loss and hyp_loss separately via `print_to_log_file`. |
 | `on_validation_epoch_end` | Override to additionally aggregate and log validation `hyp_loss` via `self.logger.log('val_hyp_losses', ...)` and `print_to_log_file`. Call `super()` for standard seg metrics. |
 | `set_deep_supervision_enabled` | Toggle both `backbone.decoder.deep_supervision` and `hyperbolic_mode`. |
@@ -201,11 +201,12 @@ Add `load_pretrained_backbone(checkpoint_path)` utility method (not used by defa
 
 **Test:** `test_integration.py`
 - One `train_step` with synthetic data: loss is scalar, backward succeeds
-- AMP compatibility: no NaN with GradScaler
-- **AMP dual-optimizer inf/nan recovery:** Force an inf gradient (e.g., scale a param to 1e38), verify both optimizers skip their `step()`, `grad_scaler` reduces scale, next step recovers normally
 - Gradient flow: gradients reach backbone (SGD), hyp_head (AdamW), label_emb (when unfrozen)
 - Both optimizers update their respective params
-- **Checkpoint round-trip:** `save_checkpoint` → `load_checkpoint`, verify both optimizer states and LR scheduler states match
+- Validation path: returns `loss` + `hyp_loss` + Dice buffers (`tp_hard/fp_hard/fn_hard`)
+- **Checkpoint round-trip:** `save_checkpoint` → `load_checkpoint`, verify hyperbolic optimizer/scheduler states restore
+
+> Note: explicit AMP inf/nan recovery stress test is still optional follow-up work.
 
 ---
 
@@ -249,21 +250,24 @@ with autocast(...):
     total_loss = seg_loss + self.hyp_weight * hyp_loss
 
 # Single backward, three optimizer steps
-# NOTE: if unscale_ detects inf/nan, ALL optimizers skip their step and
-# grad_scaler reduces the scale factor. This is correct PyTorch behavior —
-# a single loss backward produces one set of scaled gradients shared by all.
 if self.grad_scaler is not None:
     self.grad_scaler.scale(total_loss).backward()
-    self.grad_scaler.unscale_(self.optimizer)
-    self.grad_scaler.unscale_(self.optimizer_hyp_head)
-    self.grad_scaler.unscale_(self.optimizer_hyp_emb)
+    # When label_emb is frozen, optimizer_hyp_emb may have zero grads.
+    # GradScaler.step on such an optimizer raises:
+    # "No inf checks were recorded for this optimizer."
+    optimizers_with_grad = [
+        opt for opt in (self.optimizer, self.optimizer_hyp_head, self.optimizer_hyp_emb)
+        if self._optimizer_has_grad(opt)
+    ]
+    for opt in optimizers_with_grad:
+        self.grad_scaler.unscale_(opt)
     clip_grad_norm_(self.network.backbone.parameters(), 12)
     if self._is_unfreeze_epoch():
         clip_grad_norm_(self.network.label_emb.parameters(), self.hyp_text_grad_clip)
-    self.grad_scaler.step(self.optimizer)
-    self.grad_scaler.step(self.optimizer_hyp_head)
-    self.grad_scaler.step(self.optimizer_hyp_emb)
-    self.grad_scaler.update()   # called ONCE after all optimizer steps
+    for opt in optimizers_with_grad:
+        self.grad_scaler.step(opt)
+    if optimizers_with_grad:
+        self.grad_scaler.update()   # called ONCE after all optimizer steps
 else:
     total_loss.backward()
     clip_grad_norm_(self.network.backbone.parameters(), 12)
@@ -271,7 +275,8 @@ else:
         clip_grad_norm_(self.network.label_emb.parameters(), self.hyp_text_grad_clip)
     self.optimizer.step()
     self.optimizer_hyp_head.step()
-    self.optimizer_hyp_emb.step()
+    if self._optimizer_has_grad(self.optimizer_hyp_emb):
+        self.optimizer_hyp_emb.step()
 ```
 
 ### Checkpoint save/load
@@ -359,6 +364,14 @@ def on_train_epoch_start(self):
         f"HypHead LR: {np.round(self.optimizer_hyp_head.param_groups[0]['lr'], decimals=5)}, "
         f"LabelEmb LR: {np.round(self.optimizer_hyp_emb.param_groups[0]['lr'], decimals=5)}"
     )
+    # nnUNetLogger only accepts predefined keys; add ours lazily.
+    if 'lrs_hyp_head' not in self.logger.my_fantastic_logging:
+        self.logger.my_fantastic_logging['lrs_hyp_head'] = []
+    if 'lrs_hyp_emb' not in self.logger.my_fantastic_logging:
+        self.logger.my_fantastic_logging['lrs_hyp_emb'] = []
+    self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+    self.logger.log('lrs_hyp_head', self.optimizer_hyp_head.param_groups[0]['lr'], self.current_epoch)
+    self.logger.log('lrs_hyp_emb', self.optimizer_hyp_emb.param_groups[0]['lr'], self.current_epoch)
     # Curriculum temperature scheduling
     self.hyp_loss.set_epoch(self.current_epoch, self.num_epochs)
     # Freeze/unfreeze label embeddings
@@ -384,6 +397,8 @@ def on_validation_epoch_end(self, val_outputs):
         hyp_losses_val = [None for _ in range(dist.get_world_size())]
         dist.all_gather_object(hyp_losses_val, outputs_collated['hyp_loss'])
         hyp_loss_here = np.vstack(hyp_losses_val).mean()
+    if 'val_hyp_losses' not in self.logger.my_fantastic_logging:
+        self.logger.my_fantastic_logging['val_hyp_losses'] = []
     self.logger.log('val_hyp_losses', hyp_loss_here, self.current_epoch)
     # Delegate standard metrics (Dice, seg_loss) to parent
     super().on_validation_epoch_end(val_outputs)
@@ -396,6 +411,8 @@ def on_validation_epoch_end(self, val_outputs):
 
 ### `torch.compile` strategy
 Test hooks under compile in Step 0. If broken: override `_do_i_compile()` → `return False`. This is acceptable since the hyperbolic branch adds minimal compute vs the 3D convolutions.
+
+**Current status (2026-02-12):** hook gradient-flow tests pass in both eager and `torch.compile` modes, so no forced compile disable is required by default.
 
 ---
 
@@ -427,8 +444,8 @@ Test hooks under compile in Step 0. If broken: override `_do_i_compile()` → `r
 
 | File | Path | Purpose |
 |------|------|---------|
-| tree.json | `nnUNet_raw/{dataset_name}/tree.json` — resolved at runtime via `join(nnUNet_raw, self.plans_manager.dataset_name, "tree.json")` | Organ hierarchy for class_depths |
-| graph_distance_matrix.pt | `nnUNet_raw/{dataset_name}/graph_distance_matrix.pt` — same path resolution | Precomputed graph distances for LorentzTreeRankingLoss |
+| tree.json | Primary: `nnUNet_raw/{dataset_name}/tree.json`; Fallback: repo-level `Dataset/tree.json` (for local/dev runs where raw dataset folder lacks this file) | Organ hierarchy for class_depths |
+| graph_distance_matrix.pt | Primary: `nnUNet_raw/{dataset_name}/graph_distance_matrix.pt`; Fallback: repo-level `Dataset/graph_distance_matrix.pt` | Precomputed graph distances for LorentzTreeRankingLoss |
 | nnUNet plans | `nnUNet_preprocessed/Dataset501_HyperBody/nnUNetPlans.json` (available as `self.plans_manager`) | Network architecture config (includes `features_per_stage`) |
 | dataset.json | `nnUNet_raw/Dataset501_HyperBody/dataset.json` | Class labels (70 classes) |
 
@@ -440,12 +457,21 @@ Test hooks under compile in Step 0. If broken: override `_do_i_compile()` → `r
 2. **Unit tests pass:** All 5 test files green
 3. **1-epoch smoke test:**
    ```bash
-   conda activate nnunet
-   nnUNetv2_train Dataset501_HyperBody 3d_fullres 0 -tr nnUNetTrainerHyperBody --npz
+   conda run -n nnunet \
+     CUDA_VISIBLE_DEVICES=0 nnUNet_n_proc_DA=0 nnUNet_compile=false \
+     nnUNetv2_train Dataset501_HyperBody 3d_fullres 0 -tr nnUNetTrainerHyperBody
    ```
    Verify: log shows seg_loss + hyp_loss, no NaN, checkpoint saved
 4. **Inference:** Run `perform_actual_validation()`, verify valid segmentation masks
 5. **Full training:** Compare Dice with baseline nnUNet
+
+### Verification Status (2026-02-12)
+
+- ✅ Hook gate passed (`test_hook_gradient_flow.py`, eager + compile)
+- ✅ Unit/integration tests passed: `pytest -q nnUnet/tests/hyperbolic` → `21 passed`
+- ✅ GPU smoke training passed (RTX 4090, fold 0, 1 epoch / 2 train iters / 2 val iters):
+  - log: `nnUnet/nnUNet_data/nnUNet_results/Dataset501_HyperBody/nnUNetTrainerHyperBody__nnUNetPlans__3d_fullres/fold_0/training_log_2026_2_12_19_01_05.txt`
+  - checkpoints written (including hyperbolic optimizer/scheduler states): `checkpoint_final.pth`
 
 ---
 
@@ -491,7 +517,7 @@ Issues found during code review against nnUNet base class source. Changes applie
 |---|-------|-------------|
 | 4 | `build_network_architecture` static method cannot access hierarchy data | Updated method description: pass `class_depths=None` at inference, documented why this is safe (weights from checkpoint, hyperbolic_mode=False). Added caveat to Inference Compatibility section. |
 | 5 | Data file paths (`Dataset/tree.json`) unresolvable | Fixed paths to use `nnUNet_raw/{dataset_name}/` resolution via `self.plans_manager.dataset_name`. Updated Data Dependencies table. |
-| 7 | AMP dual-optimizer: if `unscale_` detects inf/nan, both optimizers skip | Added explanatory comment to train_step code snippet. Added explicit AMP inf/nan recovery test to Step 5 integration tests. |
+| 7 | AMP dual-optimizer: if `unscale_` detects inf/nan, both optimizers skip | Added explanatory comment to train_step code snippet; explicit inf/nan stress test kept as follow-up (not part of current implemented test set). |
 | 8 | Validation `hyp_loss` computed but never logged | Added `on_validation_epoch_end` override to method table. Added full code snippet with DDP-aware aggregation. |
 | 10 | `on_validation_epoch_end` missing from override list | Now listed in Step 3 method table with description. |
 | 12 | AMP FP16 in projection head 1x1 conv before `exp_map0` | Added `.float()` cast instruction to Step 1 `projection_head.py` copy notes. |
@@ -504,3 +530,37 @@ Issues found during code review against nnUNet base class source. Changes applie
 | A | `load_checkpoint` double `torch.load` — `super()` loads once, then we load again for hyp keys. Doubles memory peak for large 3D UNet checkpoints. | Changed `load_checkpoint` to override entire method: single `torch.load`, handle all keys (model weights + backbone optimizer + hyp optimizers) in one pass. No `super()` call. |
 | B | `on_train_epoch_start` doesn't call `super()` — may miss future nnUNet updates. | Added explicit comment: "intentionally not calling super() because we need to control all three schedulers". |
 | 6 | `HyperBodyNet.__init__` had undefined `in_channels` and hardcoded `embed_dim=32` | Fixed: read `in_channels = backbone.decoder.stages[-1].output_channels` (StackedConvBlocks exposes this directly). Default `embed_dim=None` → falls back to `in_channels`. |
+
+### Rev 3 — Implementation Sync (2026-02-12)
+
+| # | Change | Notes |
+|---|--------|-------|
+| D | Implemented full hyperbolic variant package | Added `nnUnet/nnunetv2/training/nnUNetTrainer/variants/hyperbolic/` with trainer, wrapper, copied hyperbolic ops/modules, and package exports. |
+| E | Added TDD test suite for hyperbolic integration | Added `nnUnet/tests/hyperbolic/` (`conftest.py`, hook/ops/network/trainer/integration tests). Full suite passes (`17 passed`). |
+| F | Fixed AMP + frozen-optimizer edge case in `train_step` | During frozen `label_emb`, `GradScaler.step(optimizer_hyp_emb)` can assert `No inf checks were recorded`. Fix: only `unscale_/step` optimizers that have gradients. |
+| G | Added local data dependency fallback | If `nnUNet_raw/{dataset_name}/tree.json` or `graph_distance_matrix.pt` is missing, fallback to repo-level `Dataset/` files for local reproducibility. |
+| H | Added logger-key bootstrap for custom metrics | Before logging `lrs_hyp_head`, `lrs_hyp_emb`, `train_hyp_losses`, `val_hyp_losses`, ensure keys exist in `nnUNetLogger` storage. |
+| I | Completed local GPU smoke training | In `conda` env `nnunet`, ran 1-epoch smoke (2 train + 2 val iterations) on RTX 4090 successfully; produced checkpoints and logged seg/hyp losses. |
+
+### Rev 4 — Post Code-Review Fixes (2026-02-12)
+
+Issues found during code review against plan. All fixes followed TDD flow (write failing test → implement fix → verify green).
+
+**Important (logic / maintenance):**
+
+| # | Issue | Fix Applied |
+|---|-------|-------------|
+| I-1 | `on_train_epoch_end` overrides base without documenting why `super()` is not called | Added comment block at top of method: "Intentionally NOT calling super() — we additionally log seg_loss and hyp_loss." Mirrors the existing comment pattern on `on_train_epoch_start`. |
+| I-3 | `_is_unfreeze_epoch()` used `==` (single epoch), gradient clipping only applied during one epoch after unfreezing | Changed to window: `hyp_freeze_epochs <= current_epoch < hyp_freeze_epochs + 3`. Clips for 3 epochs after unfreeze to prevent gradient spikes. New test: `test_is_unfreeze_epoch_covers_window_not_single_epoch`. |
+
+**Suggestions (robustness / cleanup):**
+
+| # | Issue | Fix Applied |
+|---|-------|-------------|
+| S-1 | `__init__.py` defined `__all__` before `nnUNetTrainerHyperBody` import (confusing ordering) | Moved all imports before `__all__` definition. |
+| S-2 | `_resolve_dependency_path` used hardcoded `parents[6]` to find repo root | Replaced with `_find_repo_root()` that walks up directory tree looking for `.git` marker. New test: `test_resolve_dependency_path_does_not_use_hardcoded_depth`. |
+| S-3 | `on_validation_epoch_end` calls `collate_outputs` twice (once in override, once in `super()`) | Added explanatory comment. Kept as-is since validation is not the bottleneck. |
+| S-4 | No test covering frozen-optimizer AMP edge case (`_optimizer_has_grad` guard) | Added `test_train_step_with_frozen_label_emb_does_not_raise`: sets `hyp_freeze_epochs=5`, `current_epoch=2`, verifies `train_step` succeeds with frozen `label_emb`. |
+| S-5 | `_class_names_by_index` sorted by raw `kv[1]` — lexicographic sort breaks when label values are strings (`"10" < "2"`) | Changed sort key to `int(kv[1])`. New test: `test_class_names_by_index_handles_string_label_values`. |
+
+**Test suite:** `pytest -q nnUnet/tests/hyperbolic` → `21 passed` (17 existing + 4 new).
